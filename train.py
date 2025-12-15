@@ -37,11 +37,18 @@ class RateDistortionLoss(nn.Module):
         N, _, H, W = target.size()
         out = {}
         num_pixels = N * H * W
-
-        out["bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"].values()
-        )
+        rates = output.get("rates")
+        if rates is not None:
+            bpp_y = rates["y"]
+            bpp_z = rates["z"]
+            out["bpp_y"] = bpp_y
+            out["bpp_z"] = bpp_z
+            out["bpp_loss"] = bpp_y + bpp_z
+        else:
+            out["bpp_loss"] = sum(
+                (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+                for likelihoods in output["likelihoods"].values()
+            )
         if self.type == 'mse':
             out["mse_loss"] = self.mse(output["x_hat"], target)
             out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
@@ -134,7 +141,7 @@ def train_one_epoch(
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        out_net = model(d)
+        out_net = model(d, iteration=global_step)
 
         out_criterion = criterion(out_net, d)
         out_criterion["loss"].backward()
@@ -153,13 +160,22 @@ def train_one_epoch(
             "train/lr": optimizer.param_groups[0]["lr"],
             "epoch": epoch,
         }
+        if "bpp_y" in out_criterion:
+            log_payload["train/bpp_y"] = out_criterion["bpp_y"].item()
+        if "bpp_z" in out_criterion:
+            log_payload["train/bpp_z"] = out_criterion["bpp_z"].item()
         if type == 'mse':
             log_payload["train/mse_loss"] = out_criterion["mse_loss"].item()
         else:
             log_payload["train/ms_ssim"] = out_criterion["ms_ssim_loss"].item()
+        if "vq" in out_net:
+            log_payload["train/vq_perplexity"] = out_net["vq"]["perplexity"].item()
         wandb.log(log_payload, step=global_step)
         global_step += 1
 
+        extra_vq = ""
+        if "vq" in out_net:
+            extra_vq = f"\tVQ perplexity: {out_net['vq']['perplexity'].item():.2f}"
         if i % log_interval == 0:
             if type == 'mse':
                 print(
@@ -170,6 +186,7 @@ def train_one_epoch(
                     f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
                     f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
                     f"\tAux loss: {aux_loss.item():.2f}"
+                    f"{extra_vq}"
                 )
             else:
                 print(
@@ -180,6 +197,7 @@ def train_one_epoch(
                     f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.3f} |'
                     f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
                     f"\tAux loss: {aux_loss.item():.2f}"
+                    f"{extra_vq}"
                 )
 
     return global_step
@@ -189,11 +207,13 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse', global_step
     model.eval()
     device = next(model.parameters()).device
     log_step = global_step if global_step is not None else epoch
+    track_vq = getattr(model, "use_vq", False)
     if type == 'mse':
         loss = AverageMeter()
         bpp_loss = AverageMeter()
         mse_loss = AverageMeter()
         aux_loss = AverageMeter()
+        vq_meter = AverageMeter() if track_vq else None
 
         with torch.no_grad():
             for d in test_dataloader:
@@ -201,34 +221,43 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse', global_step
                 out_net = model(d)
                 out_criterion = criterion(out_net, d)
 
-                aux_loss.update(model.aux_loss())
-                bpp_loss.update(out_criterion["bpp_loss"])
-                loss.update(out_criterion["loss"])
-                mse_loss.update(out_criterion["mse_loss"])
+                aux_loss.update(model.aux_loss().item())
+                bpp_loss.update(out_criterion["bpp_loss"].item())
+                loss.update(out_criterion["loss"].item())
+                mse_loss.update(out_criterion["mse_loss"].item())
+                if vq_meter is not None and "vq" in out_net:
+                    vq_meter.update(out_net["vq"]["perplexity"].item())
 
+        vq_text = f" |\tVQ perplexity: {vq_meter.avg:.2f}" if vq_meter is not None else ""
         print(
             f"Test epoch {epoch}: Average losses:"
             f"\tLoss: {loss.avg:.3f} |"
             f"\tMSE loss: {mse_loss.avg:.3f} |"
             f"\tBpp loss: {bpp_loss.avg:.2f} |"
-            f"\tAux loss: {aux_loss.avg:.2f}\n"
+            f"\tAux loss: {aux_loss.avg:.2f}"
+            f"{vq_text}\n"
         )
-        wandb.log(
-            {
-                "test/loss": loss.avg,
-                "test/mse_loss": mse_loss.avg,
-                "test/bpp_loss": bpp_loss.avg,
-                "test/aux_loss": aux_loss.avg,
-                "epoch": epoch,
-            },
-            step=log_step,
-        )
+        payload = {
+            "test/loss": loss.avg,
+            "test/mse_loss": mse_loss.avg,
+            "test/bpp_loss": bpp_loss.avg,
+            "test/aux_loss": aux_loss.avg,
+            "epoch": epoch,
+        }
+        if vq_meter is not None:
+            payload["test/vq_perplexity"] = vq_meter.avg
+        if out_criterion.get("bpp_y") is not None:
+            payload["test/bpp_y"] = out_criterion["bpp_y"].item()
+        if out_criterion.get("bpp_z") is not None:
+            payload["test/bpp_z"] = out_criterion["bpp_z"].item()
+        wandb.log(payload, step=log_step)
 
     else:
         loss = AverageMeter()
         bpp_loss = AverageMeter()
         ms_ssim_loss = AverageMeter()
         aux_loss = AverageMeter()
+        vq_meter = AverageMeter() if track_vq else None
 
         with torch.no_grad():
             for d in test_dataloader:
@@ -236,35 +265,43 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse', global_step
                 out_net = model(d)
                 out_criterion = criterion(out_net, d)
 
-                aux_loss.update(model.aux_loss())
-                bpp_loss.update(out_criterion["bpp_loss"])
-                loss.update(out_criterion["loss"])
-                ms_ssim_loss.update(out_criterion["ms_ssim_loss"])
+                aux_loss.update(model.aux_loss().item())
+                bpp_loss.update(out_criterion["bpp_loss"].item())
+                loss.update(out_criterion["loss"].item())
+                ms_ssim_loss.update(out_criterion["ms_ssim_loss"].item())
+                if vq_meter is not None and "vq" in out_net:
+                    vq_meter.update(out_net["vq"]["perplexity"].item())
 
+        vq_text = f" |\tVQ perplexity: {vq_meter.avg:.2f}" if vq_meter is not None else ""
         print(
             f"Test epoch {epoch}: Average losses:"
             f"\tLoss: {loss.avg:.3f} |"
             f"\tMS_SSIM loss: {ms_ssim_loss.avg:.3f} |"
             f"\tBpp loss: {bpp_loss.avg:.2f} |"
-            f"\tAux loss: {aux_loss.avg:.2f}\n"
+            f"\tAux loss: {aux_loss.avg:.2f}"
+            f"{vq_text}\n"
         )
-        wandb.log(
-            {
-                "test/loss": loss.avg,
-                "test/ms_ssim": ms_ssim_loss.avg,
-                "test/bpp_loss": bpp_loss.avg,
-                "test/aux_loss": aux_loss.avg,
-                "epoch": epoch,
-            },
-            step=log_step,
-        )
+        payload = {
+            "test/loss": loss.avg,
+            "test/ms_ssim": ms_ssim_loss.avg,
+            "test/bpp_loss": bpp_loss.avg,
+            "test/aux_loss": aux_loss.avg,
+            "epoch": epoch,
+        }
+        if vq_meter is not None:
+            payload["test/vq_perplexity"] = vq_meter.avg
+        if out_criterion.get("bpp_y") is not None:
+            payload["test/bpp_y"] = out_criterion["bpp_y"].item()
+        if out_criterion.get("bpp_z") is not None:
+            payload["test/bpp_z"] = out_criterion["bpp_z"].item()
+        wandb.log(payload, step=log_step)
 
     return loss.avg
 
 
 def save_checkpoint(state, is_best, epoch, save_path, filename):
     torch.save(state, save_path + "checkpoint_latest.pth.tar")
-    if epoch % 5 == 0:
+    if epoch % 2 == 0:
         torch.save(state, filename)
     if is_best:
         torch.save(state, save_path + "checkpoint_best.pth.tar")
@@ -358,6 +395,62 @@ def parse_args(argv):
     parser.add_argument(
         "--continue_train", action="store_true", default=True
     )
+    parser.add_argument(
+        "--vq_type",
+        type=str,
+        default="none",
+        choices=["none", "diveq", "sf-diveq"],
+        help="Vector quantization strategy to plug into the latent coder",
+    )
+    parser.add_argument(
+        "--vq_codebook_size",
+        type=int,
+        default=512,
+        help="Number of codewords for DiVeQ/SF-DiVeQ",
+    )
+    parser.add_argument(
+        "--vq_sigma2",
+        type=float,
+        default=1e-3,
+        help="Directional noise variance used by DiVeQ/SF-DiVeQ",
+    )
+    parser.add_argument(
+        "--vq_prob_decay",
+        type=float,
+        default=0.99,
+        help="EMA decay used to track codeword usage probabilities",
+    )
+    parser.add_argument(
+        "--vq_warmup_iters",
+        type=int,
+        default=5000,
+        help="Number of initial iterations without quantization (recommended for SF-DiVeQ)",
+    )
+    parser.add_argument(
+        "--vq_init_samples_per_code",
+        type=int,
+        default=40,
+        help="Latent samples per codeword when initializing the codebook",
+    )
+    parser.add_argument(
+        "--vq_replace_threshold",
+        type=float,
+        default=0.01,
+        help="Usage threshold for DiVeQ codebook replacement",
+    )
+    parser.add_argument(
+        "--vq_variant",
+        type=str,
+        default="original",
+        choices=["original", "detach"],
+        help="Use the original DiVeQ formulation or the detach variant from Appendix B.2",
+    )
+    parser.add_argument(
+        "--vq_init_cache_batches",
+        type=int,
+        default=50,
+        help="Number of recent batches to cache for codebook initialization (Appendix A.5 recommendation)",
+    )
     args = parser.parse_args(argv)
     return args
 
@@ -377,7 +470,7 @@ def main(argv):
     wandb_run = wandb.init(
         project=wandb_project,
         config=vars(args),
-        name=f"lambda_{args.lmbda}_N_{args.N}",
+        name=f"lambda_{args.lmbda}_N_{args.N}_sfdiveq_512",
     )
 
     train_transforms = transforms.Compose(
@@ -418,6 +511,16 @@ def main(argv):
         drop_path_rate=0.0,
         N=args.N,
         M=320,
+        use_vq=args.vq_type != "none",
+        vq_type=args.vq_type,
+        vq_codebook_size=args.vq_codebook_size,
+        vq_sigma2=args.vq_sigma2,
+        vq_prob_decay=args.vq_prob_decay,
+        vq_warmup_iters=args.vq_warmup_iters,
+        vq_init_samples_per_code=args.vq_init_samples_per_code,
+        vq_replace_threshold=args.vq_replace_threshold,
+        vq_variant=args.vq_variant,
+        vq_init_cache_batches=args.vq_init_cache_batches,
     )
     net = net.to(device)
     wandb.watch(net, log="all", log_freq=100)

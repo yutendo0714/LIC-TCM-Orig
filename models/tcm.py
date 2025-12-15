@@ -22,6 +22,8 @@ from timm.models.layers import trunc_normal_, DropPath
 import numpy as np
 import math
 
+from .quantizers import DiVeQQuantizer, SFDiveQQuantizer
+
 
 SCALES_MIN = 0.11
 SCALES_MAX = 256
@@ -308,7 +310,28 @@ class SwinBlock(nn.Module):
         return trans_x
 
 class TCM(CompressionModel):
-    def __init__(self, config=[2, 2, 2, 2, 2, 2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0, N=128,  M=320, num_slices=5, max_support_slices=5, **kwargs):
+    def __init__(
+        self,
+        config=[2, 2, 2, 2, 2, 2],
+        head_dim=[8, 16, 32, 32, 16, 8],
+        drop_path_rate=0,
+        N=128,
+        M=320,
+        num_slices=5,
+        max_support_slices=5,
+        use_vq=False,
+        vq_type="diveq",
+        vq_codebook_size=512,
+        vq_sigma2=1e-3,
+        vq_prob_decay=0.99,
+        vq_warmup_iters=0,
+        vq_init_samples_per_code=40,
+        vq_replace_threshold=0.01,
+        vq_replace_schedule=None,
+        vq_variant="original",
+        vq_init_cache_batches=50,
+        **kwargs,
+    ):
         super().__init__(entropy_bottleneck_channels=N)
         self.config = config
         self.head_dim = head_dim
@@ -317,6 +340,34 @@ class TCM(CompressionModel):
         self.max_support_slices = max_support_slices
         dim = N
         self.M = M
+        self.use_vq = use_vq
+        self.vq_type = vq_type
+        if self.use_vq and M % self.num_slices != 0:
+            raise ValueError("M must be divisible by num_slices when using vector quantization.")
+        if self.use_vq:
+            slice_dim = M // self.num_slices
+            schedule = vq_replace_schedule or [(0, 2000, 100), (2000, 1000000, 500)]
+            quantizer_cls = DiVeQQuantizer if vq_type.lower() == "diveq" else SFDiveQQuantizer
+            replace_cfg = schedule if quantizer_cls is DiVeQQuantizer else None
+            self.quantizers = nn.ModuleList(
+                [
+                    quantizer_cls(
+                        dim=slice_dim,
+                        num_codes=vq_codebook_size,
+                        sigma2=vq_sigma2,
+                        prob_decay=vq_prob_decay,
+                        warmup_iters=vq_warmup_iters,
+                        init_samples_per_code=vq_init_samples_per_code,
+                        replace_schedule=replace_cfg,
+                        replace_threshold=vq_replace_threshold,
+                        init_cache_batches=vq_init_cache_batches,
+                        variant=vq_variant,
+                    )
+                    for _ in range(self.num_slices)
+                ]
+            )
+        else:
+            self.quantizers = None
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
         begin = 0
 
@@ -423,7 +474,7 @@ class TCM(CompressionModel):
         updated |= super().update(force=force)
         return updated
     
-    def forward(self, x):
+    def forward(self, x, iteration=None):
         y = self.g_a(x)
         y_shape = y.shape[2:]
         z = self.h_a(y)
@@ -441,6 +492,9 @@ class TCM(CompressionModel):
         y_likelihood = []
         mu_list = []
         scale_list = []
+        vq_perplexities = []
+        num_pixels_image = x.size(0) * x.size(2) * x.size(3)
+        y_bits_total = torch.zeros(1, device=x.device)
         for slice_index, y_slice in enumerate(y_slices):
             support_slices = (y_hat_slices if self.max_support_slices < 0 else y_hat_slices[:self.max_support_slices])
             mean_support = torch.cat([latent_means] + support_slices, dim=1)
@@ -453,9 +507,20 @@ class TCM(CompressionModel):
             scale = self.cc_scale_transforms[slice_index](scale_support)
             scale = scale[:, :, :y_shape[0], :y_shape[1]]
             scale_list.append(scale)
-            _, y_slice_likelihood = self.gaussian_conditional(y_slice, scale, mu)
-            y_likelihood.append(y_slice_likelihood)
-            y_hat_slice = ste_round(y_slice - mu) + mu
+            if self.use_vq:
+                residual = y_slice - mu
+                iter_ctx = iteration if self.training else None
+                quant_result = self.quantizers[slice_index](residual, iteration=iter_ctx)
+                y_hat_slice = quant_result.quantized + mu
+                y_likelihood.append(quant_result.likelihoods)
+                if "perplexity" in quant_result.aux:
+                    vq_perplexities.append(quant_result.aux["perplexity"])
+                log_probs = quant_result.log_likelihoods
+                y_bits_total = y_bits_total - log_probs.sum() / math.log(2)
+            else:
+                _, y_slice_likelihood = self.gaussian_conditional(y_slice, scale, mu)
+                y_likelihood.append(y_slice_likelihood)
+                y_hat_slice = ste_round(y_slice - mu) + mu
             # if self.training:
             #     lrp_support = torch.cat([mean_support + torch.randn(mean_support.size()).cuda().mul(scale_support), y_hat_slice], dim=1)
             # else:
@@ -470,13 +535,23 @@ class TCM(CompressionModel):
         means = torch.cat(mu_list, dim=1)
         scales = torch.cat(scale_list, dim=1)
         y_likelihoods = torch.cat(y_likelihood, dim=1)
+        if self.use_vq:
+            rate_y = y_bits_total / num_pixels_image
+        else:
+            rate_y = (-torch.log(y_likelihoods.clamp(min=1e-9)).sum() / math.log(2)) / num_pixels_image
+        rate_z = (-torch.log(z_likelihoods.clamp(min=1e-9)).sum() / math.log(2)) / num_pixels_image
         x_hat = self.g_s(y_hat)
 
-        return {
+        out = {
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
             "para":{"means": means, "scales":scales, "y":y}
         }
+        out["rates"] = {"y": rate_y, "z": rate_z}
+        if self.use_vq and vq_perplexities:
+            avg_perplexity = torch.stack(vq_perplexities).mean()
+            out["vq"] = {"perplexity": avg_perplexity}
+        return out
 
     def load_state_dict(self, state_dict):
         update_registered_buffers(
@@ -510,18 +585,51 @@ class TCM(CompressionModel):
 
         y_slices = y.chunk(self.num_slices, 1)
         y_hat_slices = []
-        y_scales = []
-        y_means = []
 
-        cdf = self.gaussian_conditional.quantized_cdf.tolist()
-        cdf_lengths = self.gaussian_conditional.cdf_length.reshape(-1).int().tolist()
-        offsets = self.gaussian_conditional.offset.reshape(-1).int().tolist()
+        if not self.use_vq:
+            cdf = self.gaussian_conditional.quantized_cdf.tolist()
+            cdf_lengths = self.gaussian_conditional.cdf_length.reshape(-1).int().tolist()
+            offsets = self.gaussian_conditional.offset.reshape(-1).int().tolist()
 
-        encoder = BufferedRansEncoder()
-        symbols_list = []
-        indexes_list = []
+            encoder = BufferedRansEncoder()
+            symbols_list = []
+            indexes_list = []
+            y_strings = []
+
+            for slice_index, y_slice in enumerate(y_slices):
+                support_slices = (y_hat_slices if self.max_support_slices < 0 else y_hat_slices[:self.max_support_slices])
+
+                mean_support = torch.cat([latent_means] + support_slices, dim=1)
+                mean_support = self.atten_mean[slice_index](mean_support)
+                mu = self.cc_mean_transforms[slice_index](mean_support)
+                mu = mu[:, :, :y_shape[0], :y_shape[1]]
+
+                scale_support = torch.cat([latent_scales] + support_slices, dim=1)
+                scale_support = self.atten_scale[slice_index](scale_support)
+                scale = self.cc_scale_transforms[slice_index](scale_support)
+                scale = scale[:, :, :y_shape[0], :y_shape[1]]
+
+                index = self.gaussian_conditional.build_indexes(scale)
+                y_q_slice = self.gaussian_conditional.quantize(y_slice, "symbols", mu)
+                y_hat_slice = y_q_slice + mu
+
+                symbols_list.extend(y_q_slice.reshape(-1).tolist())
+                indexes_list.extend(index.reshape(-1).tolist())
+
+                lrp_support = torch.cat([mean_support, y_hat_slice], dim=1)
+                lrp = self.lrp_transforms[slice_index](lrp_support)
+                lrp = 0.5 * torch.tanh(lrp)
+                y_hat_slice += lrp
+
+                y_hat_slices.append(y_hat_slice)
+
+            encoder.encode_with_indexes(symbols_list, indexes_list, cdf, cdf_lengths, offsets)
+            y_string = encoder.flush()
+            y_strings.append(y_string)
+
+            return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
+
         y_strings = []
-
         for slice_index, y_slice in enumerate(y_slices):
             support_slices = (y_hat_slices if self.max_support_slices < 0 else y_hat_slices[:self.max_support_slices])
 
@@ -530,18 +638,9 @@ class TCM(CompressionModel):
             mu = self.cc_mean_transforms[slice_index](mean_support)
             mu = mu[:, :, :y_shape[0], :y_shape[1]]
 
-            scale_support = torch.cat([latent_scales] + support_slices, dim=1)
-            scale_support = self.atten_scale[slice_index](scale_support)
-            scale = self.cc_scale_transforms[slice_index](scale_support)
-            scale = scale[:, :, :y_shape[0], :y_shape[1]]
-
-            index = self.gaussian_conditional.build_indexes(scale)
-            y_q_slice = self.gaussian_conditional.quantize(y_slice, "symbols", mu)
-            y_hat_slice = y_q_slice + mu
-
-            symbols_list.extend(y_q_slice.reshape(-1).tolist())
-            indexes_list.extend(index.reshape(-1).tolist())
-
+            residual = y_slice - mu
+            residual_hat, indices = self.quantizers[slice_index].hard_quantize(residual)
+            y_hat_slice = residual_hat + mu
 
             lrp_support = torch.cat([mean_support, y_hat_slice], dim=1)
             lrp = self.lrp_transforms[slice_index](lrp_support)
@@ -549,12 +648,13 @@ class TCM(CompressionModel):
             y_hat_slice += lrp
 
             y_hat_slices.append(y_hat_slice)
-            y_scales.append(scale)
-            y_means.append(mu)
 
-        encoder.encode_with_indexes(symbols_list, indexes_list, cdf, cdf_lengths, offsets)
-        y_string = encoder.flush()
-        y_strings.append(y_string)
+            symbols = indices.reshape(-1).tolist()
+            indexes_list = [0] * len(symbols)
+            cdf, cdf_lengths, offsets = self.quantizers[slice_index].build_cdf()
+            encoder = BufferedRansEncoder()
+            encoder.encode_with_indexes(symbols, indexes_list, cdf, cdf_lengths, offsets)
+            y_strings.append(encoder.flush())
 
         return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
 
@@ -585,15 +685,48 @@ class TCM(CompressionModel):
 
         y_shape = [z_hat.shape[2] * 4, z_hat.shape[3] * 4]
 
-        y_string = strings[0][0]
+        y_payload = strings[0]
+
+        if not self.use_vq:
+            y_hat_slices = []
+            cdf = self.gaussian_conditional.quantized_cdf.tolist()
+            cdf_lengths = self.gaussian_conditional.cdf_length.reshape(-1).int().tolist()
+            offsets = self.gaussian_conditional.offset.reshape(-1).int().tolist()
+
+            y_string = y_payload[0]
+            decoder = RansDecoder()
+            decoder.set_stream(y_string)
+
+            for slice_index in range(self.num_slices):
+                support_slices = (y_hat_slices if self.max_support_slices < 0 else y_hat_slices[:self.max_support_slices])
+                mean_support = torch.cat([latent_means] + support_slices, dim=1)
+                mean_support = self.atten_mean[slice_index](mean_support)
+                mu = self.cc_mean_transforms[slice_index](mean_support)
+                mu = mu[:, :, :y_shape[0], :y_shape[1]]
+
+                scale_support = torch.cat([latent_scales] + support_slices, dim=1)
+                scale_support = self.atten_scale[slice_index](scale_support)
+                scale = self.cc_scale_transforms[slice_index](scale_support)
+                scale = scale[:, :, :y_shape[0], :y_shape[1]]
+
+                index = self.gaussian_conditional.build_indexes(scale)
+
+                rv = decoder.decode_stream(index.reshape(-1).tolist(), cdf, cdf_lengths, offsets)
+                rv = torch.Tensor(rv).reshape(1, -1, y_shape[0], y_shape[1])
+                y_hat_slice = self.gaussian_conditional.dequantize(rv, mu)
+
+                lrp_support = torch.cat([mean_support, y_hat_slice], dim=1)
+                lrp = self.lrp_transforms[slice_index](lrp_support)
+                lrp = 0.5 * torch.tanh(lrp)
+                y_hat_slice += lrp
+
+                y_hat_slices.append(y_hat_slice)
+
+            y_hat = torch.cat(y_hat_slices, dim=1)
+            x_hat = self.g_s(y_hat)
+            return {"x_hat": x_hat}
 
         y_hat_slices = []
-        cdf = self.gaussian_conditional.quantized_cdf.tolist()
-        cdf_lengths = self.gaussian_conditional.cdf_length.reshape(-1).int().tolist()
-        offsets = self.gaussian_conditional.offset.reshape(-1).int().tolist()
-
-        decoder = RansDecoder()
-        decoder.set_stream(y_string)
 
         for slice_index in range(self.num_slices):
             support_slices = (y_hat_slices if self.max_support_slices < 0 else y_hat_slices[:self.max_support_slices])
@@ -602,16 +735,16 @@ class TCM(CompressionModel):
             mu = self.cc_mean_transforms[slice_index](mean_support)
             mu = mu[:, :, :y_shape[0], :y_shape[1]]
 
-            scale_support = torch.cat([latent_scales] + support_slices, dim=1)
-            scale_support = self.atten_scale[slice_index](scale_support)
-            scale = self.cc_scale_transforms[slice_index](scale_support)
-            scale = scale[:, :, :y_shape[0], :y_shape[1]]
-
-            index = self.gaussian_conditional.build_indexes(scale)
-
-            rv = decoder.decode_stream(index.reshape(-1).tolist(), cdf, cdf_lengths, offsets)
-            rv = torch.Tensor(rv).reshape(1, -1, y_shape[0], y_shape[1])
-            y_hat_slice = self.gaussian_conditional.dequantize(rv, mu)
+            stream = y_payload[slice_index]
+            decoder = RansDecoder()
+            decoder.set_stream(stream)
+            num_entries = mu.size(0) * y_shape[0] * y_shape[1]
+            indexes_list = [0] * num_entries
+            cdf, cdf_lengths, offsets = self.quantizers[slice_index].build_cdf()
+            symbols = decoder.decode_stream(indexes_list, cdf, cdf_lengths, offsets)
+            indices = torch.tensor(symbols, device=mu.device, dtype=torch.long).view(mu.size(0), y_shape[0], y_shape[1])
+            residual_hat = self.quantizers[slice_index].decode_indices(indices)
+            y_hat_slice = residual_hat + mu
 
             lrp_support = torch.cat([mean_support, y_hat_slice], dim=1)
             lrp = self.lrp_transforms[slice_index](lrp_support)
@@ -621,6 +754,5 @@ class TCM(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
-        x_hat = self.g_s(y_hat).clamp_(0, 1)
-
+        x_hat = self.g_s(y_hat)
         return {"x_hat": x_hat}

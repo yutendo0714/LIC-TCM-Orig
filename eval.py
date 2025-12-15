@@ -25,6 +25,9 @@ def compute_msssim(a, b):
     return -10 * math.log10(1-ms_ssim(a, b, data_range=1.).item())
 
 def compute_bpp(out_net):
+    if "rates" in out_net:
+        rate = out_net["rates"]["y"] + out_net["rates"]["z"]
+        return rate.item() if torch.is_tensor(rate) else rate
     size = out_net['x_hat'].size()
     num_pixels = size[0] * size[2] * size[3]
     return sum(torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
@@ -67,6 +70,25 @@ def parse_args(argv):
         "--real", action="store_true", default=True
     )
     parser.set_defaults(real=False)
+    parser.add_argument(
+        "--vq-type",
+        type=str,
+        default="none",
+        choices=["none", "diveq", "sf-diveq"],
+        help="Vector quantization mode used during training",
+    )
+    parser.add_argument("--vq-codebook-size", type=int, default=512)
+    parser.add_argument("--vq-sigma2", type=float, default=1e-3)
+    parser.add_argument("--vq-warmup-iters", type=int, default=0)
+    parser.add_argument("--vq-init-samples-per-code", type=int, default=40)
+    parser.add_argument("--vq-init-cache-batches", type=int, default=50)
+    parser.add_argument(
+        "--vq-variant",
+        type=str,
+        default="original",
+        choices=["original", "detach"],
+        help="DiVeQ variant used during training",
+    )
     args = parser.parse_args(argv)
     return args
 
@@ -83,7 +105,21 @@ def main(argv):
         device = 'cuda:0'
     else:
         device = 'cpu'
-    net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=128, M=320)
+    net = TCM(
+        config=[2,2,2,2,2,2],
+        head_dim=[8, 16, 32, 32, 16, 8],
+        drop_path_rate=0.0,
+        N=128,
+        M=320,
+        use_vq=args.vq_type != "none",
+        vq_type=args.vq_type,
+        vq_codebook_size=args.vq_codebook_size,
+        vq_sigma2=args.vq_sigma2,
+        vq_warmup_iters=args.vq_warmup_iters,
+        vq_variant=args.vq_variant,
+        vq_init_samples_per_code=args.vq_init_samples_per_code,
+        vq_init_cache_batches=args.vq_init_cache_batches,
+    )
     net = net.to(device)
     net.eval()
     count = 0
@@ -118,10 +154,15 @@ def main(argv):
                 total_time += (e - s)
                 out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
                 num_pixels = x.size(0) * x.size(2) * x.size(3)
-                print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
+                y_streams, z_streams = out_enc["strings"]
+                bits = (
+                    sum(len(stream) for stream in (y_streams if isinstance(y_streams, list) else [y_streams]))
+                    + sum(len(stream) for stream in z_streams)
+                ) * 8.0 / num_pixels
+                print(f'Bitrate: {bits:.3f}bpp')
                 print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
                 print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
-                Bit_rate += sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
+                Bit_rate += bits
                 PSNR += compute_psnr(x, out_dec["x_hat"])
                 MS_SSIM += compute_msssim(x, out_dec["x_hat"])
 
