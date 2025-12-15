@@ -342,6 +342,7 @@ class TCM(CompressionModel):
         self.M = M
         self.use_vq = use_vq
         self.vq_type = vq_type
+        self.vq_codebook_size = vq_codebook_size
         if self.use_vq and M % self.num_slices != 0:
             raise ValueError("M must be divisible by num_slices when using vector quantization.")
         if self.use_vq:
@@ -424,6 +425,37 @@ class TCM(CompressionModel):
             self.hs_up2
         )
 
+        if self.use_vq:
+            self.hp_up = [ConvTransBlock(N, N, 32, 4, 0, 'W' if not i % 2 else 'SW')
+                          for i in range(config[3])] + \
+                         [subpel_conv3x3(2 * N, 320, 2)]
+
+            self.h_prior_s = nn.Sequential(
+                *[ResidualBlockUpsample(192, 2 * N, 2)] + \
+                self.hp_up
+            )
+
+            self.atten_prior = nn.ModuleList(
+                nn.Sequential(
+                    SWAtten((320 + (320 // self.num_slices) * min(i, 5)),
+                            (320 + (320 // self.num_slices) * min(i, 5)),
+                            16, self.window_size, 0, inter_dim=128)
+                ) for i in range(self.num_slices)
+            )
+            self.cc_prior_transforms = nn.ModuleList(
+                nn.Sequential(
+                    conv(320 + (320 // self.num_slices) * min(i, 5), 224, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    conv(224, 128, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    conv(128, self.vq_codebook_size, stride=1, kernel_size=3),
+                ) for i in range(self.num_slices)
+            )
+        else:
+            self.h_prior_s = None
+            self.atten_prior = None
+            self.cc_prior_transforms = None
+
 
         self.atten_mean = nn.ModuleList(
             nn.Sequential(
@@ -466,6 +498,7 @@ class TCM(CompressionModel):
 
         self.entropy_bottleneck = EntropyBottleneck(192)
         self.gaussian_conditional = GaussianConditional(None)
+        self.vq_coder_precision = 16
 
     def update(self, scale_table=None, force=False):
         if scale_table is None:
@@ -484,7 +517,12 @@ class TCM(CompressionModel):
         z_tmp = z - z_offset
         z_hat = ste_round(z_tmp) + z_offset
 
-        latent_scales = self.h_scale_s(z_hat)
+        latent_prior = None
+        if self.use_vq:
+            latent_prior = self.h_prior_s(z_hat)
+            latent_scales = None
+        else:
+            latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
 
         y_slices = y.chunk(self.num_slices, 1)
@@ -502,22 +540,29 @@ class TCM(CompressionModel):
             mu = self.cc_mean_transforms[slice_index](mean_support)
             mu = mu[:, :, :y_shape[0], :y_shape[1]]
             mu_list.append(mu)
-            scale_support = torch.cat([latent_scales] + support_slices, dim=1)
-            scale_support = self.atten_scale[slice_index](scale_support)
-            scale = self.cc_scale_transforms[slice_index](scale_support)
-            scale = scale[:, :, :y_shape[0], :y_shape[1]]
-            scale_list.append(scale)
             if self.use_vq:
+                prior_support = torch.cat([latent_prior] + support_slices, dim=1)
+                prior_support = self.atten_prior[slice_index](prior_support)
+                logits = self.cc_prior_transforms[slice_index](prior_support)
+                logits = logits[:, :, :y_shape[0], :y_shape[1]]
                 residual = y_slice - mu
                 iter_ctx = iteration if self.training else None
                 quant_result = self.quantizers[slice_index](residual, iteration=iter_ctx)
                 y_hat_slice = quant_result.quantized + mu
-                y_likelihood.append(quant_result.likelihoods)
+                log_probs = F.log_softmax(logits, dim=1)
+                gather_index = quant_result.indices.unsqueeze(1)
+                symbol_log_probs = torch.gather(log_probs, 1, gather_index).squeeze(1)
+                symbol_probs = symbol_log_probs.exp().unsqueeze(1)
+                y_likelihood.append(symbol_probs)
                 if "perplexity" in quant_result.aux:
                     vq_perplexities.append(quant_result.aux["perplexity"])
-                log_probs = quant_result.log_likelihoods
-                y_bits_total = y_bits_total - log_probs.sum() / math.log(2)
+                y_bits_total = y_bits_total - symbol_log_probs.sum() / math.log(2)
             else:
+                scale_support = torch.cat([latent_scales] + support_slices, dim=1)
+                scale_support = self.atten_scale[slice_index](scale_support)
+                scale = self.cc_scale_transforms[slice_index](scale_support)
+                scale = scale[:, :, :y_shape[0], :y_shape[1]]
+                scale_list.append(scale)
                 _, y_slice_likelihood = self.gaussian_conditional(y_slice, scale, mu)
                 y_likelihood.append(y_slice_likelihood)
                 y_hat_slice = ste_round(y_slice - mu) + mu
@@ -533,7 +578,7 @@ class TCM(CompressionModel):
 
         y_hat = torch.cat(y_hat_slices, dim=1)
         means = torch.cat(mu_list, dim=1)
-        scales = torch.cat(scale_list, dim=1)
+        scales = torch.cat(scale_list, dim=1) if scale_list else None
         y_likelihoods = torch.cat(y_likelihood, dim=1)
         if self.use_vq:
             rate_y = y_bits_total / num_pixels_image
@@ -542,10 +587,13 @@ class TCM(CompressionModel):
         rate_z = (-torch.log(z_likelihoods.clamp(min=1e-9)).sum() / math.log(2)) / num_pixels_image
         x_hat = self.g_s(y_hat)
 
+        para = {"means": means, "y": y}
+        if scales is not None:
+            para["scales"] = scales
         out = {
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
-            "para":{"means": means, "scales":scales, "y":y}
+            "para": para,
         }
         out["rates"] = {"y": rate_y, "z": rate_z}
         if self.use_vq and vq_perplexities:
@@ -580,7 +628,12 @@ class TCM(CompressionModel):
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
-        latent_scales = self.h_scale_s(z_hat)
+        latent_prior = None
+        latent_scales = None
+        if self.use_vq:
+            latent_prior = self.h_prior_s(z_hat)
+        else:
+            latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
 
         y_slices = y.chunk(self.num_slices, 1)
@@ -642,6 +695,12 @@ class TCM(CompressionModel):
             residual_hat, indices = self.quantizers[slice_index].hard_quantize(residual)
             y_hat_slice = residual_hat + mu
 
+            prior_support = torch.cat([latent_prior] + support_slices, dim=1)
+            prior_support = self.atten_prior[slice_index](prior_support)
+            logits = self.cc_prior_transforms[slice_index](prior_support)
+            logits = logits[:, :, :y_shape[0], :y_shape[1]].contiguous()
+            cdf, cdf_lengths, offsets, indexes_list = self._build_vq_cdfs_from_logits(logits)
+
             lrp_support = torch.cat([mean_support, y_hat_slice], dim=1)
             lrp = self.lrp_transforms[slice_index](lrp_support)
             lrp = 0.5 * torch.tanh(lrp)
@@ -650,8 +709,6 @@ class TCM(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
             symbols = indices.reshape(-1).tolist()
-            indexes_list = [0] * len(symbols)
-            cdf, cdf_lengths, offsets = self.quantizers[slice_index].build_cdf()
             encoder = BufferedRansEncoder()
             encoder.encode_with_indexes(symbols, indexes_list, cdf, cdf_lengths, offsets)
             y_strings.append(encoder.flush())
@@ -680,7 +737,12 @@ class TCM(CompressionModel):
 
     def decompress(self, strings, shape):
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
-        latent_scales = self.h_scale_s(z_hat)
+        latent_scales = None
+        latent_prior = None
+        if self.use_vq:
+            latent_prior = self.h_prior_s(z_hat)
+        else:
+            latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
 
         y_shape = [z_hat.shape[2] * 4, z_hat.shape[3] * 4]
@@ -738,9 +800,11 @@ class TCM(CompressionModel):
             stream = y_payload[slice_index]
             decoder = RansDecoder()
             decoder.set_stream(stream)
-            num_entries = mu.size(0) * y_shape[0] * y_shape[1]
-            indexes_list = [0] * num_entries
-            cdf, cdf_lengths, offsets = self.quantizers[slice_index].build_cdf()
+            prior_support = torch.cat([latent_prior] + support_slices, dim=1)
+            prior_support = self.atten_prior[slice_index](prior_support)
+            logits = self.cc_prior_transforms[slice_index](prior_support)
+            logits = logits[:, :, :y_shape[0], :y_shape[1]].contiguous()
+            cdf, cdf_lengths, offsets, indexes_list = self._build_vq_cdfs_from_logits(logits)
             symbols = decoder.decode_stream(indexes_list, cdf, cdf_lengths, offsets)
             indices = torch.tensor(symbols, device=mu.device, dtype=torch.long).view(mu.size(0), y_shape[0], y_shape[1])
             residual_hat = self.quantizers[slice_index].decode_indices(indices)
@@ -756,3 +820,40 @@ class TCM(CompressionModel):
         y_hat = torch.cat(y_hat_slices, dim=1)
         x_hat = self.g_s(y_hat)
         return {"x_hat": x_hat}
+
+    def _build_vq_cdfs_from_logits(self, logits, precision=None):
+        if precision is None:
+            precision = self.vq_coder_precision
+        probs = F.softmax(logits, dim=1)
+        flat = probs.permute(0, 2, 3, 1).contiguous().view(-1, probs.size(1))
+        flat = flat.detach().cpu()
+        total = 1 << precision
+        pmf_int = torch.clamp((flat * total).round().long(), min=1)
+        row_sums = pmf_int.sum(dim=1)
+        adjustments = total - row_sums
+        num_codes = pmf_int.size(1)
+        if torch.any(adjustments != 0):
+            adjustments_list = adjustments.tolist()
+            for row_idx, adj in enumerate(adjustments_list):
+                if adj == 0:
+                    continue
+                if adj > 0:
+                    pmf_int[row_idx, 0] += adj
+                else:
+                    deficit = -adj
+                    for col in range(num_codes):
+                        available = pmf_int[row_idx, col] - 1
+                        if available <= 0:
+                            continue
+                        take = min(available, deficit)
+                        pmf_int[row_idx, col] -= take
+                        deficit -= take
+                        if deficit == 0:
+                            break
+        cdf = torch.zeros(pmf_int.size(0), num_codes + 1, dtype=torch.int32)
+        cdf[:, 1:] = torch.cumsum(pmf_int.to(torch.int32), dim=1)
+        cdf_list = cdf.tolist()
+        cdf_lengths = [num_codes + 1] * cdf.size(0)
+        offsets = [0] * cdf.size(0)
+        indexes = list(range(pmf_int.size(0)))
+        return cdf_list, cdf_lengths, offsets, indexes
