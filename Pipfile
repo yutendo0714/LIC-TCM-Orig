@@ -12,6 +12,7 @@ timm = "*"
 wandb = "*"
 pypdf2 = "*"
 scipy = "*"
+lmdb = "*"
 
 [dev-packages]
 

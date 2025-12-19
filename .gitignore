@@ -132,3 +132,4 @@ dmypy.json
 
 wandb/
 checkpoints_sf/
+checkpoints_sf2/

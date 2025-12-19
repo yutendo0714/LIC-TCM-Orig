@@ -1,5 +1,8 @@
 import argparse
+import io
 import math
+import os
+import pickle
 import random
 import sys
 
@@ -7,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 from compressai.datasets import ImageFolder
@@ -15,8 +18,9 @@ from compressai.zoo import models
 from pytorch_msssim import ms_ssim
 
 from models import TCM
-import os
 import wandb
+import lmdb
+from PIL import Image
 
 torch.backends.cudnn.deterministic=True
 torch.backends.cudnn.benchmark=False
@@ -82,6 +86,81 @@ class CustomDataParallel(nn.DataParallel):
             return super().__getattr__(key)
         except AttributeError:
             return getattr(self.module, key)
+
+
+class ImageLMDBDataset(Dataset):
+    """Dataset reader for LMDB archives containing RGB images."""
+
+    def __init__(self, lmdb_path, transform=None):
+        if not os.path.exists(lmdb_path):
+            raise RuntimeError(f'Missing LMDB file at "{lmdb_path}"')
+        self.lmdb_path = lmdb_path
+        self.transform = transform
+        self._env = None
+        self.keys = self._load_keys()
+
+    def _open_env(self):
+        if self._env is None:
+            self._env = lmdb.open(
+                self.lmdb_path,
+                subdir=os.path.isdir(self.lmdb_path),
+                readonly=True,
+                lock=False,
+                readahead=False,
+                meminit=False,
+            )
+
+    def _load_keys(self):
+        env = lmdb.open(
+            self.lmdb_path,
+            subdir=os.path.isdir(self.lmdb_path),
+            readonly=True,
+            lock=False,
+            readahead=False,
+            meminit=False,
+        )
+        with env.begin(write=False) as txn:
+            raw_keys = txn.get(b"__keys__")
+            if raw_keys is None:
+                raise RuntimeError(
+                    "LMDB is missing '__keys__'. Please rebuild it with key metadata."
+                )
+            keys = pickle.loads(raw_keys)
+        env.close()
+        return keys
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, index):
+        self._open_env()
+        key = self.keys[index]
+        with self._env.begin(write=False) as txn:
+            byteflow = txn.get(key)
+        if byteflow is None:
+            raise IndexError(f"Failed to load key {key} from LMDB.")
+        sample = pickle.loads(byteflow)
+        if isinstance(sample, (tuple, list)):
+            imgbuf = sample[0]
+        elif isinstance(sample, dict):
+            imgbuf = sample.get("image") or sample.get("img")
+            if imgbuf is None:
+                raise ValueError("Dictionary sample missing 'image' key.")
+        else:
+            imgbuf = sample
+        img = Image.open(io.BytesIO(imgbuf)).convert("RGB")
+        if self.transform:
+            return self.transform(img)
+        return img
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_env"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._env = None
 
 
 def configure_optimizers(net, args):
@@ -451,6 +530,11 @@ def parse_args(argv):
         default=50,
         help="Number of recent batches to cache for codebook initialization (Appendix A.5 recommendation)",
     )
+    parser.add_argument(
+        "--train_lmdb",
+        type=str,
+        help="Path to LMDB archive used for the training split (test split stays on ImageFolder)",
+    )
     args = parser.parse_args(argv)
     return args
 
@@ -470,7 +554,7 @@ def main(argv):
     wandb_run = wandb.init(
         project=wandb_project,
         config=vars(args),
-        name=f"lambda_{args.lmbda}_N_{args.N}_sfdiveq_512",
+        name=f"gemini_lambda_{args.lmbda}_N_{args.N}_sfdiveq_512",
     )
 
     train_transforms = transforms.Compose(
@@ -482,7 +566,11 @@ def main(argv):
     )
 
 
-    train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
+    if args.train_lmdb:
+        print(f"Loading training samples from LMDB: {args.train_lmdb}")
+        train_dataset = ImageLMDBDataset(args.train_lmdb, transform=train_transforms)
+    else:
+        train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
     test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
