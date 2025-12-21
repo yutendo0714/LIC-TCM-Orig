@@ -20,7 +20,9 @@ from pytorch_msssim import ms_ssim
 from models import TCM
 import wandb
 import lmdb
-from PIL import Image
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 torch.backends.cudnn.deterministic=True
 torch.backends.cudnn.benchmark=False

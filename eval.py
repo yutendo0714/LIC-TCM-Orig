@@ -11,7 +11,9 @@ import argparse
 import time
 import warnings
 from pytorch_msssim import ms_ssim
-from PIL import Image
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 warnings.filterwarnings("ignore")
 
 print(torch.cuda.is_available())
